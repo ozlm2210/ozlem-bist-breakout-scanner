@@ -9,7 +9,15 @@ import pandas as pd
 
 from breakout import BreakoutDirection, BreakoutMode, detect_breakout, result_to_row
 from config import LOOKBACK_DAYS, MONTHLY_LOOKBACK_DAYS, TIMEFRAMES, sort_timeframes
-from data_loader import load_bars, load_daily, load_hourly, resample_monthly, resample_weekly
+from data_loader import (
+    fetch_tradingview_daily_snapshots,
+    load_bars,
+    load_daily,
+    load_hourly,
+    merge_daily_snapshot,
+    resample_monthly,
+    resample_weekly,
+)
 
 
 def scan_symbol(
@@ -71,6 +79,11 @@ def scan_universe(
     done = 0
 
     bar_cache: dict[tuple[str, str], pd.DataFrame] = {}
+    daily_snapshots = (
+        fetch_tradingview_daily_snapshots(symbols)
+        if refresh_prices and any(tf in {"1D", "1W", "1M"} for tf in timeframes)
+        else {}
+    )
 
     def _load_symbol(sym: str) -> tuple[str, dict[str, pd.DataFrame]]:
         frames: dict[str, pd.DataFrame] = {}
@@ -78,6 +91,7 @@ def scan_universe(
         if daily_tfs:
             days = MONTHLY_LOOKBACK_DAYS if "1M" in daily_tfs else LOOKBACK_DAYS
             daily = load_daily(sym, days=days, use_cache=use_cache, refresh=refresh_prices)
+            daily = merge_daily_snapshot(sym, daily, daily_snapshots.get(sym))
             if "1D" in daily_tfs:
                 frames["1D"] = daily
             if "1W" in daily_tfs:

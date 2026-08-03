@@ -54,6 +54,78 @@ def expected_latest_daily_date(now: datetime | None = None) -> date:
     return candidate
 
 
+def fetch_tradingview_daily_snapshots(
+    symbols: list[str],
+    now: datetime | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Return the latest completed daily OHLCV bar from TradingView.
+
+    This is a lightweight fallback for the newest bar when Yahoo throttles the
+    Streamlit server. It is deliberately disabled during the live BIST session
+    so an incomplete intraday candle is never treated as a completed day.
+    """
+    wanted = {str(symbol).upper().strip() for symbol in symbols if str(symbol).strip()}
+    if not wanted:
+        return {}
+
+    local_now = now.astimezone(_MARKET_TZ) if now and now.tzinfo else (now or datetime.now(_MARKET_TZ))
+    if local_now.weekday() < 5 and time(10, 0) <= local_now.time() < time(18, 30):
+        return {}
+
+    try:
+        from tradingview_screener import Query
+
+        _, raw = (
+            Query()
+            .set_markets("turkey")
+            .select("name", "exchange", "open", "high", "low", "close", "volume")
+            .get_scanner_data()
+        )
+    except Exception:
+        return {}
+
+    if raw is None or raw.empty:
+        return {}
+
+    trade_date = pd.Timestamp(expected_latest_daily_date(local_now))
+    snapshots: dict[str, pd.DataFrame] = {}
+    for _, row in raw.iterrows():
+        symbol = str(row.get("name", "")).upper().strip()
+        if symbol not in wanted or str(row.get("exchange", "")).upper() != "BIST":
+            continue
+        values = {
+            key: pd.to_numeric(row.get(key), errors="coerce")
+            for key in ("open", "high", "low", "close", "volume")
+        }
+        if pd.isna(values["close"]):
+            continue
+        frame = pd.DataFrame([values], index=pd.DatetimeIndex([trade_date], name="date"))
+        snapshots[symbol] = _normalize_ohlcv(frame)
+        snapshots[symbol].index.name = "date"
+    return snapshots
+
+
+def merge_daily_snapshot(
+    symbol: str,
+    daily: pd.DataFrame,
+    snapshot: pd.DataFrame | None,
+    *,
+    persist: bool = True,
+) -> pd.DataFrame:
+    """Merge a TradingView completed bar into daily history and its cache."""
+    if snapshot is None or snapshot.empty:
+        return daily
+    merged = pd.concat([daily, snapshot]) if not daily.empty else snapshot.copy()
+    merged = _normalize_ohlcv(merged)
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    merged.index.name = "date"
+    if persist and not merged.empty:
+        path = CACHE_DAILY / f"{symbol.upper().strip()}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        merged.to_csv(path)
+    return merged
+
+
 def yahoo_ticker(symbol: str) -> str:
     sym = symbol.upper().strip()
     return YAHOO_TICKER_MAP.get(sym, f"{sym}{YFINANCE_SUFFIX}")
