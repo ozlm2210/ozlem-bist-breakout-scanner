@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import threading
+import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -72,16 +74,29 @@ def fetch_tradingview_daily_snapshots(
     if local_now.weekday() < 5 and time(10, 0) <= local_now.time() < time(18, 30):
         return {}
 
+    columns = ["name", "exchange", "open", "high", "low", "close", "volume"]
+    payload = {
+        "markets": ["turkey"],
+        "symbols": {"query": {"types": []}, "tickers": []},
+        "options": {"lang": "en"},
+        "columns": columns,
+        "range": [0, 1000],
+    }
     try:
-        from tradingview_screener import Query
-
-        _, raw = (
-            Query()
-            .set_markets("turkey")
-            .select("name", "exchange", "open", "high", "low", "close", "volume")
-            .limit(1000)
-            .get_scanner_data()
+        request = Request(
+            "https://scanner.tradingview.com/turkey/scan",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://www.tradingview.com/",
+            },
+            method="POST",
         )
+        with urlopen(request, timeout=30) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        rows = [item.get("d", []) for item in body.get("data", [])]
+        raw = pd.DataFrame([row for row in rows if len(row) == len(columns)], columns=columns)
     except Exception:
         return {}
 

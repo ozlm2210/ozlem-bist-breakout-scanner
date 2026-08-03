@@ -11,6 +11,7 @@ from breakout import BreakoutDirection, BreakoutMode, detect_breakout, result_to
 from config import LOOKBACK_DAYS, MONTHLY_LOOKBACK_DAYS, TIMEFRAMES, sort_timeframes
 from data_loader import (
     fetch_tradingview_daily_snapshots,
+    expected_latest_daily_date,
     load_bars,
     load_daily,
     load_hourly,
@@ -92,6 +93,11 @@ def scan_universe(
             days = MONTHLY_LOOKBACK_DAYS if "1M" in daily_tfs else LOOKBACK_DAYS
             daily = load_daily(sym, days=days, use_cache=use_cache, refresh=refresh_prices)
             daily = merge_daily_snapshot(sym, daily, daily_snapshots.get(sym))
+            if refresh_prices and (
+                daily.empty or daily.index[-1].date() < expected_latest_daily_date()
+            ):
+                # Never report a historical cached candle as a fresh breakout.
+                daily = pd.DataFrame(columns=daily.columns)
             if "1D" in daily_tfs:
                 frames["1D"] = daily
             if "1W" in daily_tfs:
