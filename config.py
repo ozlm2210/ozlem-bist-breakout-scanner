@@ -28,6 +28,7 @@ UNIVERSE_CHOICES: tuple[str, ...] = (
     UNIVERSE_BIST_ALL,
 )
 SCAN_RESULTS_CSV = DATA_DIR / "scan_results.csv"
+SCAN_HISTORY_CSV = DATA_DIR / "scan_history.csv"
 SCAN_INFO_CSV = DATA_DIR / "scan_info.csv"
 SCAN_META_JSON = DATA_DIR / "scan_meta.json"
 

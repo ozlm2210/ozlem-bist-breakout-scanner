@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from config import (
+    SCAN_HISTORY_CSV,
     SCAN_INFO_CSV,
     SCAN_META_JSON,
     SCAN_RESULTS_CSV,
@@ -60,33 +61,33 @@ def format_scanned_at(iso_value: str | datetime | None, *, short: bool = False) 
 
 
 def save_scan_results(df: pd.DataFrame, meta: dict[str, Any]) -> Path:
-    """Write scan results, scan_info.csv, and metadata JSON to data_cache/."""
+    """Write the latest scan separately from optional historical results."""
     ensure_dirs()
     scanned_at = datetime.now(_DISPLAY_TZ).replace(microsecond=0)
     scanned_iso = scanned_at.isoformat(timespec="seconds")
     scanned_display = format_scanned_at(scanned_at)
 
-    out = df.copy()
-    out["scanned_at"] = scanned_iso
+    latest = df.copy()
+    latest["scanned_at"] = scanned_iso
+    latest.to_csv(SCAN_RESULTS_CSV, index=False)
 
-    # Accumulate results historically
-    if SCAN_RESULTS_CSV.is_file():
+    # Keep history in its own file; never mix it into the current scan.
+    history = latest.copy()
+    if SCAN_HISTORY_CSV.is_file() and not latest.empty:
         try:
-            df_old = pd.read_csv(SCAN_RESULTS_CSV)
+            df_old = pd.read_csv(SCAN_HISTORY_CSV)
             if not df_old.empty:
                 df_old["bar_time"] = df_old["bar_time"].astype(str)
-                out["bar_time"] = out["bar_time"].astype(str)
-                
-                df_merged = pd.concat([df_old, out], ignore_index=True)
-                df_merged = df_merged.drop_duplicates(
+                history["bar_time"] = history["bar_time"].astype(str)
+                history = pd.concat([df_old, history], ignore_index=True)
+                history = history.drop_duplicates(
                     subset=["symbol", "timeframe", "direction", "bar_time"],
-                    keep="last"
+                    keep="last",
                 )
-                out = df_merged
         except Exception:
             pass
-
-    out.to_csv(SCAN_RESULTS_CSV, index=False)
+    if not history.empty:
+        history.to_csv(SCAN_HISTORY_CSV, index=False)
 
     timeframes = meta.get("timeframes") or []
     if isinstance(timeframes, list):
@@ -109,7 +110,7 @@ def save_scan_results(df: pd.DataFrame, meta: dict[str, Any]) -> Path:
         "atr_mult": meta.get("atr_mult", ""),
         "only_52w": meta.get("only_52w", False),
         "max_symbols": meta.get("max_symbols", ""),
-        "breakout_count": len(out),
+        "breakout_count": len(latest),
     }
     pd.DataFrame([info_row], columns=list(_SCAN_INFO_COLUMNS)).to_csv(SCAN_INFO_CSV, index=False)
 
@@ -118,7 +119,7 @@ def save_scan_results(df: pd.DataFrame, meta: dict[str, Any]) -> Path:
         "scanned_at": scanned_iso,
         "scanned_at_display": scanned_display,
         "saved_at": scanned_iso,
-        "row_count": len(out),
+        "row_count": len(latest),
     }
     SCAN_META_JSON.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return SCAN_RESULTS_CSV
@@ -179,4 +180,3 @@ def _parse_bool(val: object) -> bool:
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return False
     return str(val).strip().lower() in {"1", "true", "yes", "t"}
-

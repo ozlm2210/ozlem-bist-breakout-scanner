@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import threading
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
@@ -32,6 +33,25 @@ from config import (
 from viop_loader import load_viop_symbols
 
 _YF_LOCK = threading.Lock()
+_MARKET_TZ = ZoneInfo("Europe/Istanbul")
+
+
+def _previous_weekday(value: date) -> date:
+    while value.weekday() >= 5:
+        value -= timedelta(days=1)
+    return value
+
+
+def expected_latest_daily_date(now: datetime | None = None) -> date:
+    """Latest BIST session that should be available from an EOD data feed."""
+    local_now = now.astimezone(_MARKET_TZ) if now and now.tzinfo else (now or datetime.now(_MARKET_TZ))
+    candidate = local_now.date()
+    if candidate.weekday() >= 5:
+        return _previous_weekday(candidate)
+    # Before the evening data update, the latest completed session is yesterday.
+    if local_now.time() < time(18, 30):
+        return _previous_weekday(candidate - timedelta(days=1))
+    return candidate
 
 
 def yahoo_ticker(symbol: str) -> str:
@@ -181,7 +201,7 @@ def _sibling_daily_cache(symbol: str) -> pd.DataFrame:
 
 def fetch_daily(symbol: str, days: int = LOOKBACK_DAYS) -> pd.DataFrame:
     ticker = yahoo_ticker(symbol)
-    end = date.today() + timedelta(days=1)
+    end = datetime.now(_MARKET_TZ).date() + timedelta(days=1)
     start = end - timedelta(days=int(days * 1.6))
     try:
         with _YF_LOCK:
@@ -271,15 +291,21 @@ _OHLCV_AGG = {
 def resample_weekly(daily: pd.DataFrame) -> pd.DataFrame:
     if daily.empty:
         return daily
-    weekly = daily.resample("W-FRI").agg(_OHLCV_AGG)
-    return weekly.dropna(subset=["close"])
+    grouped = daily.sort_index().groupby(daily.sort_index().index.to_period("W-FRI"))
+    weekly = grouped.agg(_OHLCV_AGG).dropna(subset=["close"])
+    weekly.index = pd.DatetimeIndex(grouped.apply(lambda frame: frame.index[-1]).values)
+    weekly.index.name = daily.index.name
+    return weekly
 
 
 def resample_monthly(daily: pd.DataFrame) -> pd.DataFrame:
     if daily.empty:
         return daily
-    monthly = daily.resample("ME").agg(_OHLCV_AGG)
-    monthly = monthly.dropna(subset=["close"])
+    daily = daily.sort_index()
+    grouped = daily.groupby(daily.index.to_period("M"))
+    monthly = grouped.agg(_OHLCV_AGG).dropna(subset=["close"])
+    monthly.index = pd.DatetimeIndex(grouped.apply(lambda frame: frame.index[-1]).values)
+    monthly.index.name = daily.index.name
     # Extrapolate the in-progress month's volume to a full-month estimate so
     # the volume-surge filter is comparable with completed months (a month has
     # ~21 trading sessions; without this, a mid-month scan can never fire).
@@ -293,17 +319,22 @@ def resample_monthly(daily: pd.DataFrame) -> pd.DataFrame:
     return monthly
 
 
-def load_daily(symbol: str, days: int = LOOKBACK_DAYS, use_cache: bool = True) -> pd.DataFrame:
+def load_daily(
+    symbol: str,
+    days: int = LOOKBACK_DAYS,
+    use_cache: bool = True,
+    refresh: bool = False,
+) -> pd.DataFrame:
     sym = symbol.upper()
     path = CACHE_DAILY / f"{sym}.csv"
     min_rows = min(60, days // 3) if days <= 500 else int(days * 0.45)
 
     df_cached = pd.DataFrame()
-    if use_cache and path.is_file():
+    if (use_cache or refresh) and path.is_file():
         try:
             df_cached = _read_csv_cache(path)
-            fresh = not df_cached.empty and df_cached.index[-1].date() >= date.today() - timedelta(days=3)
-            if fresh and len(df_cached) >= min_rows:
+            fresh = not df_cached.empty and df_cached.index[-1].date() >= expected_latest_daily_date()
+            if not refresh and fresh and len(df_cached) >= min_rows:
                 return df_cached
         except Exception:
             pass
@@ -312,9 +343,10 @@ def load_daily(symbol: str, days: int = LOOKBACK_DAYS, use_cache: bool = True) -
     if not df_cached.empty:
         try:
             last_cached_date = df_cached.index[-1].date()
-            if last_cached_date < date.today():
+            expected_date = expected_latest_daily_date()
+            if refresh or last_cached_date < expected_date:
                 start_fetch = last_cached_date - timedelta(days=5) # 5 days overlap for safety
-                end_fetch = date.today() + timedelta(days=1)
+                end_fetch = datetime.now(_MARKET_TZ).date() + timedelta(days=1)
                 df_new = fetch_daily_range(sym, start_fetch, end_fetch)
                 if not df_new.empty:
                     df_merged = pd.concat([df_cached, df_new])
@@ -329,23 +361,23 @@ def load_daily(symbol: str, days: int = LOOKBACK_DAYS, use_cache: bool = True) -
     df = _sibling_daily_cache(sym)
     if df.empty or len(df) < min_rows:
         df = fetch_daily(sym, days=days)
-    if not df.empty and use_cache:
+    if not df.empty and (use_cache or refresh):
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(path)
     return df
 
 
-def load_hourly(symbol: str, use_cache: bool = True) -> pd.DataFrame:
+def load_hourly(symbol: str, use_cache: bool = True, refresh: bool = False) -> pd.DataFrame:
     sym = symbol.upper()
     path = CACHE_HOURLY / f"{sym}.csv"
     min_rows = 40
 
     df_cached = pd.DataFrame()
-    if use_cache and path.is_file():
+    if (use_cache or refresh) and path.is_file():
         try:
             df_cached = _read_csv_cache(path)
             fresh = not df_cached.empty and df_cached.index[-1].date() >= date.today() - timedelta(days=2)
-            if fresh and len(df_cached) >= min_rows:
+            if not refresh and fresh and len(df_cached) >= min_rows:
                 return df_cached
         except Exception:
             pass
@@ -354,9 +386,9 @@ def load_hourly(symbol: str, use_cache: bool = True) -> pd.DataFrame:
     if not df_cached.empty:
         try:
             last_cached_date = df_cached.index[-1].date()
-            if last_cached_date < date.today():
+            if refresh or last_cached_date < datetime.now(_MARKET_TZ).date():
                 start_fetch = last_cached_date - timedelta(days=3)
-                end_fetch = date.today() + timedelta(days=1)
+                end_fetch = datetime.now(_MARKET_TZ).date() + timedelta(days=1)
                 df_new = fetch_hourly_range(sym, start_fetch, end_fetch)
                 if not df_new.empty:
                     df_merged = pd.concat([df_cached, df_new])
@@ -368,7 +400,7 @@ def load_hourly(symbol: str, use_cache: bool = True) -> pd.DataFrame:
             pass
 
     df = fetch_hourly(sym)
-    if not df.empty and use_cache:
+    if not df.empty and (use_cache or refresh):
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(path)
     return df
@@ -379,16 +411,22 @@ def load_bars(
     timeframe: str,
     *,
     use_cache: bool = True,
+    refresh: bool = False,
     days: int = LOOKBACK_DAYS,
 ) -> pd.DataFrame:
     """Return OHLCV for the requested timeframe key: 1H, 1D, 1W, 1M."""
     tf = timeframe.upper()
     if tf == "1H":
-        return load_hourly(symbol, use_cache=use_cache)
+        return load_hourly(symbol, use_cache=use_cache, refresh=refresh)
     if tf == "1M":
-        daily = load_daily(symbol, days=max(days, MONTHLY_LOOKBACK_DAYS), use_cache=use_cache)
+        daily = load_daily(
+            symbol,
+            days=max(days, MONTHLY_LOOKBACK_DAYS),
+            use_cache=use_cache,
+            refresh=refresh,
+        )
         return resample_monthly(daily)
-    daily = load_daily(symbol, days=days, use_cache=use_cache)
+    daily = load_daily(symbol, days=days, use_cache=use_cache, refresh=refresh)
     if tf == "1W":
         return resample_weekly(daily)
     return daily

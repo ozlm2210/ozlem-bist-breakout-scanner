@@ -715,6 +715,7 @@ def render_breakout_tab(
                 mode=breakout_mode,
                 progress_callback=on_progress,
                 use_cache=use_cache,
+                refresh_prices=True,
                 vol_mult=vol_mult,
                 lookback=lookback,
                 atr_mult=atr_mult if breakout_mode == "strict" else None,
@@ -972,7 +973,11 @@ with st.sidebar:
         help="Breakout bar true range must exceed this multiple of 14-bar ATR.",
     )
     only_52w = st.checkbox("52-week high breakouts only (1D/1W/1M)", value=False)
-    use_cache = st.checkbox("Use price cache", value=True)
+    use_cache = st.checkbox(
+        "Use price cache",
+        value=True,
+        help="Speeds up later scans. Force Refresh still checks Yahoo for the newest bars.",
+    )
     if breakout_mode == "strict":
         st.caption(
             "Strict: close > prior N-bar high/low · volume > threshold × 20-bar avg · "

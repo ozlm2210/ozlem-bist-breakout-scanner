@@ -8,8 +8,8 @@ from typing import Callable, Optional
 import pandas as pd
 
 from breakout import BreakoutDirection, BreakoutMode, detect_breakout, result_to_row
-from config import TIMEFRAMES, sort_timeframes
-from data_loader import load_bars
+from config import LOOKBACK_DAYS, MONTHLY_LOOKBACK_DAYS, TIMEFRAMES, sort_timeframes
+from data_loader import load_bars, load_daily, load_hourly, resample_monthly, resample_weekly
 
 
 def scan_symbol(
@@ -19,13 +19,19 @@ def scan_symbol(
     *,
     mode: BreakoutMode = "standard",
     use_cache: bool = True,
+    refresh_prices: bool = False,
     vol_mult: Optional[float] = None,
     lookback: Optional[int] = None,
     atr_period: Optional[int] = None,
     atr_mult: Optional[float] = None,
     direction_filter: Optional[BreakoutDirection] = None,
 ) -> Optional[dict]:
-    df = bars if bars is not None else load_bars(symbol, timeframe, use_cache=use_cache)
+    df = bars if bars is not None else load_bars(
+        symbol,
+        timeframe,
+        use_cache=use_cache,
+        refresh=refresh_prices,
+    )
     result = detect_breakout(
         df,
         symbol,
@@ -47,6 +53,7 @@ def scan_universe(
     mode: BreakoutMode = "standard",
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     use_cache: bool = True,
+    refresh_prices: bool = False,
     vol_mult: Optional[float] = None,
     lookback: Optional[int] = None,
     atr_period: Optional[int] = None,
@@ -60,22 +67,36 @@ def scan_universe(
     rows: list[dict] = []
     from ml_engine import train_confidence_model, predict_confidence
     ml_model = train_confidence_model(use_cache=True)
-    total = len(symbols) * len(timeframes)
+    total = len(symbols)
     done = 0
 
     bar_cache: dict[tuple[str, str], pd.DataFrame] = {}
 
-    def _load(sym: str, tf: str) -> tuple[str, str, pd.DataFrame]:
-        return sym, tf, load_bars(sym, tf, use_cache=use_cache)
+    def _load_symbol(sym: str) -> tuple[str, dict[str, pd.DataFrame]]:
+        frames: dict[str, pd.DataFrame] = {}
+        daily_tfs = [tf for tf in timeframes if tf in {"1D", "1W", "1M"}]
+        if daily_tfs:
+            days = MONTHLY_LOOKBACK_DAYS if "1M" in daily_tfs else LOOKBACK_DAYS
+            daily = load_daily(sym, days=days, use_cache=use_cache, refresh=refresh_prices)
+            if "1D" in daily_tfs:
+                frames["1D"] = daily
+            if "1W" in daily_tfs:
+                frames["1W"] = resample_weekly(daily)
+            if "1M" in daily_tfs:
+                frames["1M"] = resample_monthly(daily)
+        if "1H" in timeframes:
+            frames["1H"] = load_hourly(sym, use_cache=use_cache, refresh=refresh_prices)
+        return sym, frames
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(_load, sym, tf) for sym in symbols for tf in timeframes]
+        futures = [pool.submit(_load_symbol, sym) for sym in symbols]
         for fut in as_completed(futures):
-            sym, tf, df = fut.result()
-            bar_cache[(sym, tf)] = df
+            sym, frames = fut.result()
+            for tf, df in frames.items():
+                bar_cache[(sym, tf)] = df
             done += 1
             if progress_callback:
-                progress_callback(done, total, f"{sym} ({tf})")
+                progress_callback(done, total, sym)
 
     for sym in symbols:
         for tf in timeframes:
