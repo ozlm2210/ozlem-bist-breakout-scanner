@@ -79,6 +79,7 @@ def fetch_tradingview_daily_snapshots(
             Query()
             .set_markets("turkey")
             .select("name", "exchange", "open", "high", "low", "close", "volume")
+            .limit(1000)
             .get_scanner_data()
         )
     except Exception:
