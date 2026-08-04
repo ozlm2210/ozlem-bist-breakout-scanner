@@ -34,7 +34,7 @@ from scanner import filter_results, scan_universe
 DISCLAIMER_URL = "#disclaimer"
 
 st.set_page_config(
-    page_title="BIST Breakout Scanner",
+    page_title="Özlem BIST Breakout Scanner",
     page_icon="🚀",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -854,7 +854,7 @@ st.markdown(
     """
 <div style="background:linear-gradient(135deg,#1e3a5f 0%,#7c3aed 55%,#db2777 100%);
 padding:1.2rem 1.5rem;border-radius:12px;margin-bottom:1rem;">
-<h2 style="color:white;margin:0;">🚀 BIST Breakout Scanner</h2>
+<h2 style="color:white;margin:0;">🚀 Özlem BIST Breakout Scanner</h2>
 <p style="color:#e2e8f0;margin:0.4rem 0 0;">
 Donchian breakouts with volume confirmation on <strong>1 Hour</strong>, <strong>1 Day</strong>,
 <strong>1 Week</strong> and <strong>1 Month</strong> timeframes.
