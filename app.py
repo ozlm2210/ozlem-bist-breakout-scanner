@@ -1336,7 +1336,7 @@ with st.sidebar:
         "Tarama türü",
         ["Donchian Kırılımı", "Camarilla P–R4–R5", "Hacim–DMI–EMA"],
         horizontal=False,
-        help="Donchian, uzun dönem Camarilla veya bağımsız Hacim–DMI–EMA taraması.",
+        help="Donchian, uzun dönem Camarilla veya dört filtreli ortak tarama.",
     )
 
     if scan_type == "Donchian Kırılımı":
@@ -1427,14 +1427,14 @@ with st.sidebar:
             "İlk Tüm BIST taraması uzun tarih verisini bir kez indirip önbelleğe alır."
         )
     else:
-        st.header("Hacim–DMI–EMA")
+        st.header("BIST Ortak Tarama")
         st.info(
-            "Hacim, DMI ve EMA koşulları **ayrı ayrı** taranır. "
-            "Bir sonuçta görünmek için üç taramanın tamamını geçmek gerekmez."
+            "Hacim, DMI, Günlük EMA ve 4 Saat EMA ayrı filtrelerdir. "
+            "Sonuç yalnız Kesişim Özeti olarak gösterilir."
         )
         st.caption(
-            "Yalnız son mumdaki koşullar değerlendirilir. İlk Tüm BIST taraması "
-            "günlük ve saatlik verileri güncellerken daha uzun sürebilir."
+            "Hisseler geçtikleri filtre sayısına göre sıralanır; "
+            "Excel çıktısında yalnız Kesisim_Ozeti sayfası bulunur."
         )
 
     _render_disclaimer_sidebar()
