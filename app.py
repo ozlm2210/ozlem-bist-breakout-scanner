@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import date
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Callable, Optional
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
 from plotly.subplots import make_subplots
 
 from config import (
@@ -18,6 +24,8 @@ from config import (
     UNIVERSE_BIST10,
     UNIVERSE_BIST_ALL,
     UNIVERSE_VIOP,
+    DATA_DIR,
+    YFINANCE_SUFFIX,
     ensure_dirs,
     sort_timeframes,
 )
@@ -30,9 +38,270 @@ from results_store import (
     save_scan_results,
 )
 from scanner import filter_results, scan_universe
-from prebreakout import scan_prebreakout_universe
 
 DISCLAIMER_URL = "#disclaimer"
+
+CAMARILLA_CACHE = DATA_DIR / "camarilla_daily"
+CAMARILLA_LEVEL_PRIORITY = (
+    "10Y R5", "10Y R4", "10Y P",
+    "5Y R5", "5Y R4", "5Y P",
+    "1Y R5", "1Y R4", "1Y P",
+)
+
+
+def _cam_p(high: float, low: float, close: float) -> float:
+    return (high + low + close) / 3.0
+
+
+def _cam_r4(high: float, low: float, close: float) -> float:
+    return close + 1.1 * (high - low) / 2.0
+
+
+def _cam_r5(high: float, low: float, close: float) -> float:
+    return (high / low) * close if low else float("nan")
+
+
+def _cam_normalize(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    out = frame.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = out.columns.get_level_values(0)
+    out = out.rename(columns=lambda value: str(value).lower())
+    out = out.loc[:, ~out.columns.duplicated()]
+    keep = [name for name in ("open", "high", "low", "close", "volume") if name in out]
+    out = out[keep]
+    for name in keep:
+        out[name] = pd.to_numeric(out[name], errors="coerce")
+    out.index = pd.to_datetime(out.index).tz_localize(None).normalize()
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    return out.dropna(subset=["high", "low", "close"])
+
+
+def _cam_ticker(symbol: str) -> str:
+    return f"{symbol.upper().strip()}{YFINANCE_SUFFIX}"
+
+
+def _cam_required_start(selected_levels: list[str], today: date) -> date:
+    starts = [today.year - 1]
+    if any(level.startswith("5Y") for level in selected_levels):
+        starts.append((today.year // 5) * 5 - 5)
+    if any(level.startswith("10Y") for level in selected_levels):
+        starts.append((today.year // 10) * 10 - 10)
+    return date(min(starts), 1, 1)
+
+
+def _cam_read_cache(symbol: str) -> pd.DataFrame:
+    path = CAMARILLA_CACHE / f"{symbol.upper()}.csv"
+    if not path.is_file():
+        return pd.DataFrame()
+    try:
+        return _cam_normalize(pd.read_csv(path, parse_dates=["date"], index_col="date"))
+    except Exception:
+        return pd.DataFrame()
+
+
+def _cam_write_cache(symbol: str, frame: pd.DataFrame) -> None:
+    if frame.empty:
+        return
+    CAMARILLA_CACHE.mkdir(parents=True, exist_ok=True)
+    out = frame.copy()
+    out.index.name = "date"
+    out.to_csv(CAMARILLA_CACHE / f"{symbol.upper()}.csv")
+
+
+def _cam_extract_ticker(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    if not isinstance(raw.columns, pd.MultiIndex):
+        return _cam_normalize(raw)
+    level0 = raw.columns.get_level_values(0)
+    level1 = raw.columns.get_level_values(1)
+    try:
+        if ticker in level0:
+            return _cam_normalize(raw[ticker])
+        if ticker in level1:
+            return _cam_normalize(raw.xs(ticker, axis=1, level=1))
+    except Exception:
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _cam_download_batch(symbols: list[str], start: date) -> dict[str, pd.DataFrame]:
+    tickers = [_cam_ticker(symbol) for symbol in symbols]
+    try:
+        raw = yf.download(
+            tickers=tickers,
+            start=start.isoformat(),
+            end=(date.today() + timedelta(days=1)).isoformat(),
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+        )
+    except Exception:
+        return {}
+    return {symbol: _cam_extract_ticker(raw, _cam_ticker(symbol)) for symbol in symbols}
+
+
+def _cam_live_snapshots(symbols: list[str]) -> dict[str, pd.DataFrame]:
+    wanted = {symbol.upper().strip() for symbol in symbols}
+    payload = {
+        "markets": ["turkey"],
+        "symbols": {"query": {"types": []}, "tickers": []},
+        "options": {"lang": "en"},
+        "columns": ["name", "exchange", "open", "high", "low", "close", "volume"],
+        "range": [0, 1000],
+    }
+    try:
+        request = Request(
+            "https://scanner.tradingview.com/turkey/scan",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+            method="POST",
+        )
+        with urlopen(request, timeout=30) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return {}
+    snapshots: dict[str, pd.DataFrame] = {}
+    columns = payload["columns"]
+    for item in body.get("data", []):
+        values = item.get("d", [])
+        if len(values) != len(columns):
+            continue
+        row = dict(zip(columns, values))
+        symbol = str(row.get("name", "")).upper().strip()
+        if symbol not in wanted or str(row.get("exchange", "")).upper() != "BIST":
+            continue
+        frame = pd.DataFrame(
+            [{key: row.get(key) for key in ("open", "high", "low", "close", "volume")}],
+            index=pd.DatetimeIndex([pd.Timestamp.today().normalize()], name="date"),
+        )
+        snapshots[symbol] = _cam_normalize(frame)
+    return snapshots
+
+
+def _cam_calculate_levels(daily: pd.DataFrame, today: date | None = None) -> dict[str, float]:
+    if daily is None or daily.empty:
+        return {}
+    today = today or date.today()
+    frame = daily.sort_index()
+    annual = frame.groupby(frame.index.year).agg(
+        high=("high", "max"), low=("low", "min"), close=("close", "last")
+    ).dropna(subset=["high", "low", "close"])
+    blocks = {
+        "1Y": (today.year - 1, today.year - 1),
+        "5Y": ((today.year // 5) * 5 - 5, (today.year // 5) * 5 - 1),
+        "10Y": ((today.year // 10) * 10 - 10, (today.year // 10) * 10 - 1),
+    }
+    levels: dict[str, float] = {}
+    for label, (start_year, end_year) in blocks.items():
+        block = annual.loc[(annual.index >= start_year) & (annual.index <= end_year)]
+        if block.empty:
+            continue
+        high = float(block["high"].max())
+        low = float(block["low"].min())
+        close = float(block.iloc[-1]["close"])
+        levels[f"{label} P"] = _cam_p(high, low, close)
+        levels[f"{label} R4"] = _cam_r4(high, low, close)
+        levels[f"{label} R5"] = _cam_r5(high, low, close)
+    return levels
+
+
+def _cam_detect(
+    daily: pd.DataFrame,
+    symbol: str,
+    selected_levels: list[str],
+    *,
+    use_close: bool = False,
+) -> Optional[dict]:
+    if daily is None or len(daily) < 2:
+        return None
+    frame = daily.sort_index()
+    levels = _cam_calculate_levels(frame)
+    current, previous = frame.iloc[-1], frame.iloc[-2]
+    source = "close" if use_close else "high"
+    current_source, previous_source = float(current[source]), float(previous[source])
+    current_close = float(current["close"])
+    fresh, earlier = [], []
+    for name in selected_levels:
+        level = levels.get(name)
+        if level is None or pd.isna(level):
+            continue
+        if current_source > level and previous_source <= level:
+            fresh.append(name)
+        elif current_close > level:
+            earlier.append(name)
+    matched = fresh or earlier
+    if not matched:
+        return None
+    strongest = next(name for name in CAMARILLA_LEVEL_PRIORITY if name in matched)
+    level_price = float(levels[strongest])
+    return {
+        "symbol": symbol.upper(),
+        "status": "Bugün geçen" if fresh else "Daha önce geçen",
+        "level": strongest,
+        "level_price": round(level_price, 4),
+        "close": round(current_close, 4),
+        "high": round(float(current["high"]), 4),
+        "cross_pct": round((current_source / level_price - 1.0) * 100.0, 2),
+        "bar_time": frame.index[-1],
+        "method": "Kapanış" if use_close else "Mum içi yüksek",
+    }
+
+
+def scan_camarilla_universe(
+    symbols: list[str],
+    selected_levels: list[str],
+    *,
+    use_close: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    max_workers: int = 6,
+) -> pd.DataFrame:
+    symbols = [str(symbol).upper().strip() for symbol in symbols]
+    CAMARILLA_CACHE.mkdir(parents=True, exist_ok=True)
+    required_start = _cam_required_start(selected_levels, date.today())
+    histories = {symbol: _cam_read_cache(symbol) for symbol in symbols}
+    missing = [
+        symbol for symbol, frame in histories.items()
+        if frame.empty or frame.index[0].date() > required_start
+    ]
+    chunks = [missing[index:index + 25] for index in range(0, len(missing), 25)]
+    downloaded: dict[str, pd.DataFrame] = {}
+    if chunks:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(chunks))) as pool:
+            futures = [pool.submit(_cam_download_batch, chunk, required_start) for chunk in chunks]
+            for future in as_completed(futures):
+                downloaded.update(future.result())
+    snapshots = _cam_live_snapshots(symbols)
+    rows: list[dict] = []
+    total = len(symbols)
+    for index, symbol in enumerate(symbols, start=1):
+        frame = downloaded.get(symbol, histories.get(symbol, pd.DataFrame()))
+        cached = histories.get(symbol, pd.DataFrame())
+        if not cached.empty and not frame.empty:
+            frame = _cam_normalize(pd.concat([cached, frame]))
+        snapshot = snapshots.get(symbol)
+        if snapshot is not None and not snapshot.empty:
+            frame = _cam_normalize(pd.concat([frame, snapshot]))
+        if not frame.empty:
+            _cam_write_cache(symbol, frame)
+            row = _cam_detect(frame, symbol, selected_levels, use_close=use_close)
+            if row:
+                rows.append(row)
+        if progress_callback:
+            progress_callback(index, total, symbol)
+    if not rows:
+        return pd.DataFrame()
+    result = pd.DataFrame(rows)
+    status_rank = {"Bugün geçen": 0, "Daha önce geçen": 1}
+    level_rank = {name: index for index, name in enumerate(CAMARILLA_LEVEL_PRIORITY)}
+    result["_status"] = result["status"].map(status_rank).fillna(9)
+    result["_level"] = result["level"].map(level_rank).fillna(99)
+    result = result.sort_values(["_status", "_level", "cross_pct"], ascending=[True, True, False])
+    return result.drop(columns=["_status", "_level"]).reset_index(drop=True)
 
 st.set_page_config(
     page_title="Özlem BIST Breakout Scanner",
@@ -849,94 +1118,91 @@ def render_breakout_tab(
         st.info("No cached scan yet. Configure settings and click **Force Refresh Scan**.")
 
 
-def render_prebreakout_tab(scan_symbols: list[str]) -> None:
-    """Render the no-score pre-breakout consolidation scan."""
-    st.markdown("### Kırılım Öncesi Sıkışma Taraması")
+def render_camarilla_tab(scan_symbols: list[str]) -> None:
+    st.markdown("### Camarilla P–R4–R5 Taraması")
     st.caption(
-        "Puanlama yoktur. Yalnızca bütün koşulları birlikte sağlayan hisseler listelenir: "
-        "fiyat > SMA44, EMA10 > EMA34, RSI aralığı, dirence yakınlık, dar bant ve hacim artışı."
+        "Seçtiğiniz 1Y, 5Y ve 10Y Camarilla seviyelerini tarar. "
+        "Aynı mumda birden fazla seviye geçilirse Pine kodundaki en güçlü seviye gösterilir."
     )
+    if not camarilla_levels:
+        st.warning("Taramak için en az bir Camarilla seviyesi seçin.")
+        return
 
     run_scan = st.button(
-        "Sıkışma Taramasını Başlat",
+        "Camarilla Taramasını Başlat",
         type="primary",
-        key="prebreakout_run",
-        help="Seçilen hisseler için en güncel fiyatları kontrol ederek taramayı başlatır.",
+        key="camarilla_run",
     )
     if run_scan:
-        progress = st.progress(0.0, text="Fiyatlar yükleniyor…")
+        progress = st.progress(0.0, text="Uzun dönem fiyat geçmişi yükleniyor…")
         status = st.empty()
 
         def on_progress(done: int, total: int, label: str) -> None:
-            progress.progress(done / max(total, 1), text=f"{label} yükleniyor ({done}/{total})…")
+            progress.progress(done / max(total, 1), text=f"{label} taranıyor ({done}/{total})…")
             status.caption(label)
 
-        with st.spinner("Kırılım öncesi sıkışmalar taranıyor…"):
-            results = scan_prebreakout_universe(
+        with st.spinner("Camarilla seviyeleri hesaplanıyor…"):
+            results = scan_camarilla_universe(
                 scan_symbols,
-                pre_selected_tfs or ["1D"],
+                camarilla_levels,
+                use_close=camarilla_use_close,
                 progress_callback=on_progress,
-                use_cache=pre_use_cache,
-                refresh_prices=True,
-                rsi_min=pre_rsi_min,
-                rsi_max=pre_rsi_max,
-                resistance_lookback=pre_resistance_lookback,
-                max_distance_pct=pre_max_distance_pct,
-                consolidation_bars=pre_consolidation_bars,
-                max_range_pct=pre_max_range_pct,
-                recent_volume_bars=pre_recent_volume_bars,
-                baseline_volume_bars=pre_baseline_volume_bars,
-                min_recent_volume_ratio=pre_min_volume_ratio,
             )
         progress.progress(1.0, text="Tamamlandı")
         status.empty()
-        st.session_state["prebreakout_results"] = results
-        st.session_state["prebreakout_symbols_scanned"] = len(scan_symbols)
+        st.session_state["camarilla_results"] = results
+        st.session_state["camarilla_symbols_scanned"] = len(scan_symbols)
 
-    if "prebreakout_results" not in st.session_state:
-        st.info("Ayarları seçip **Sıkışma Taramasını Başlat** düğmesine basın.")
+    if "camarilla_results" not in st.session_state:
+        st.info("Seviyeleri seçip **Camarilla Taramasını Başlat** düğmesine basın.")
         return
 
-    results = st.session_state["prebreakout_results"]
-    symbols_scanned = st.session_state.get("prebreakout_symbols_scanned", len(scan_symbols))
+    results = st.session_state["camarilla_results"]
+    scanned = st.session_state.get("camarilla_symbols_scanned", len(scan_symbols))
     if results.empty:
-        st.warning(
-            f"{symbols_scanned} hissede bütün sıkışma koşullarını aynı anda sağlayan sonuç bulunamadı."
-        )
+        st.warning(f"{scanned} hissede seçilen seviyelere uygun sonuç bulunamadı.")
         return
 
+    today_results = results[results["status"] == "Bugün geçen"]
+    earlier_results = results[results["status"] == "Daha önce geçen"]
     col1, col2, col3 = st.columns(3)
-    col1.metric("Aday", len(results))
-    col2.metric("Hisse", results["symbol"].nunique())
-    col3.metric("Taranan", symbols_scanned)
+    col1.metric("Bugün geçen", len(today_results))
+    col2.metric("Daha önce geçen", len(earlier_results))
+    col3.metric("Taranan", scanned)
 
-    display = results.rename(
-        columns={
-            "symbol": "Hisse",
-            "timeframe": "Dönem",
-            "bar_time": "Mum tarihi",
-            "close": "Fiyat",
-            "sma44": "SMA44",
-            "ema10": "EMA10",
-            "ema34": "EMA34",
-            "rsi14": "RSI14",
-            "resistance": "Direnç",
-            "distance_to_resistance_pct": "Dirence uzaklık %",
-            "consolidation_range_pct": "Sıkışma aralığı %",
-            "recent_volume_ratio": "Son hacim oranı",
-        }
-    )
-    st.dataframe(display, use_container_width=True, hide_index=True)
-    st.caption(
-        "Liste dirence en yakın hisseler önde olacak şekilde sıralanır; bu sıralama puanlama değildir."
-    )
-    st.download_button(
-        "CSV İndir",
-        results.to_csv(index=False),
-        file_name="kirilim_oncesi_sikisma.csv",
-        mime="text/csv",
-        key="prebreakout_download",
-    )
+    def _show(frame: pd.DataFrame, key: str) -> None:
+        if frame.empty:
+            st.info("Bu bölümde sonuç bulunamadı.")
+            return
+        display = frame.rename(
+            columns={
+                "symbol": "Hisse",
+                "status": "Durum",
+                "level": "Seviye",
+                "level_price": "Seviye fiyatı",
+                "close": "Kapanış",
+                "high": "Yüksek",
+                "cross_pct": "Seviye üstü %",
+                "bar_time": "Mum tarihi",
+                "method": "Yöntem",
+            }
+        )
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.download_button(
+            "CSV İndir",
+            frame.to_csv(index=False),
+            file_name=f"camarilla_{key}.csv",
+            mime="text/csv",
+            key=f"camarilla_download_{key}",
+        )
+
+    today_tab, earlier_tab, all_tab = st.tabs(["Bugün geçenler", "Daha önce geçenler", "Tümü"])
+    with today_tab:
+        _show(today_results, "bugun_gecenler")
+    with earlier_tab:
+        _show(earlier_results, "daha_once_gecenler")
+    with all_tab:
+        _show(results, "tum_sonuclar")
 
 
 ensure_dirs()
@@ -1038,9 +1304,9 @@ with st.sidebar:
     st.divider()
     scan_type = st.radio(
         "Tarama türü",
-        ["Donchian Kırılımı", "Kırılım Öncesi Sıkışma"],
+        ["Donchian Kırılımı", "Camarilla P–R4–R5"],
         horizontal=False,
-        help="Mevcut kırılım taraması veya henüz kırılmamış sıkışma adayları.",
+        help="Donchian kırılımı veya uzun dönem Camarilla seviyeleri.",
     )
 
     if scan_type == "Donchian Kırılımı":
@@ -1102,39 +1368,33 @@ with st.sidebar:
                 else:
                     st.error("Failed to train model.")
     else:
-        st.header("Kırılım Öncesi Sıkışma")
-        st.success("Ana fiyat koşulu: **Fiyat > SMA44** (EMA44 kullanılmaz).")
-        pre_selected_tfs = st.multiselect(
-            "Dönemler",
-            options=list(TIMEFRAME_ORDER),
-            default=["1D", "1W", "1M"],
-            format_func=lambda key: TIMEFRAMES[key].label,
-            key="prebreakout_timeframes",
+        st.header("Camarilla P–R4–R5")
+        st.info(
+            "Önceki tamamlanmış **1, 5 ve 10 yıllık** dönemlerin Camarilla "
+            "seviyelerini tarar."
         )
-        pre_selected_tfs = sort_timeframes(pre_selected_tfs)
-        pre_rsi_min, pre_rsi_max = st.slider(
-            "RSI14 aralığı",
-            30.0,
-            80.0,
-            (50.0, 65.0),
-            1.0,
+        camarilla_levels = st.multiselect(
+            "Taranacak seviyeler",
+            options=[
+                "1Y P", "1Y R4", "1Y R5",
+                "5Y P", "5Y R4", "5Y R5",
+                "10Y P", "10Y R4", "10Y R5",
+            ],
+            default=["1Y R4", "1Y R5", "5Y R4", "5Y R5", "10Y R4", "10Y R5"],
+            help="P seviyeleri daha erken sinyal verebilir; başlangıçta yalnız R4 ve R5 seçilidir.",
+            key="camarilla_levels",
         )
-        pre_resistance_lookback = st.slider("Direnç bakış süresi (mum)", 10, 60, 20, 1)
-        pre_max_distance_pct = st.slider("Dirence en fazla uzaklık (%)", 1.0, 10.0, 5.0, 0.5)
-        pre_consolidation_bars = st.slider("Sıkışma süresi (mum)", 5, 30, 10, 1)
-        pre_max_range_pct = st.slider("En fazla sıkışma aralığı (%)", 2.0, 15.0, 8.0, 0.5)
-        pre_recent_volume_bars = st.slider("Son hacim ortalaması (mum)", 2, 10, 5, 1)
-        pre_baseline_volume_bars = st.slider("Karşılaştırma hacmi (mum)", 10, 40, 20, 1)
-        pre_min_volume_ratio = st.slider("En az son hacim oranı", 0.8, 2.0, 1.0, 0.05)
-        pre_use_cache = st.checkbox(
-            "Fiyat önbelleğini kullan",
-            value=True,
-            key="prebreakout_cache",
-            help="Tarama başlatıldığında en yeni mum ayrıca kontrol edilir.",
+        camarilla_method = st.radio(
+            "Geçiş yöntemi",
+            ["Mum içi yüksek", "Kapanış"],
+            index=0,
+            help="Mum içi yüksek Pine kodundaki varsayılan alarm davranışıdır.",
+            key="camarilla_method",
         )
+        camarilla_use_close = camarilla_method == "Kapanış"
         st.caption(
-            "Koşullar: Fiyat > SMA44 · EMA10 > EMA34 · RSI14 seçilen aralıkta · "
-            "henüz direnç kırılmamış · dar bant · son hacim ortalaması yükselmiş."
+            "P = merkez pivot · R4 = güçlü direnç · R5 = üst hedef. "
+            "İlk Tüm BIST taraması uzun tarih verisini bir kez indirip önbelleğe alır."
         )
 
     _render_disclaimer_sidebar()
@@ -1147,6 +1407,6 @@ if scan_type == "Donchian Kırılımı":
         universe_sample=universe_sample,
     )
 else:
-    render_prebreakout_tab(scan_symbols)
+    render_camarilla_tab(scan_symbols)
 
 _render_disclaimer_footer()
