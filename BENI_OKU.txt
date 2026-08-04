@@ -1,0 +1,2 @@
+GitHub'a bu klasordeki app.py dosyasini yukleyin.
+ZIP dosyasinin kendisini yuklemeyin.

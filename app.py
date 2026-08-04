@@ -225,28 +225,32 @@ def _cam_detect(
     source = "close" if use_close else "high"
     current_source, previous_source = float(current[source]), float(previous[source])
     current_close = float(current["close"])
-    fresh, earlier = [], []
+    fresh = []
     for name in selected_levels:
         level = levels.get(name)
         if level is None or pd.isna(level):
             continue
         if current_source > level and previous_source <= level:
             fresh.append(name)
-        elif current_close > level:
-            earlier.append(name)
-    matched = fresh or earlier
-    if not matched:
+    if not fresh:
         return None
-    strongest = next(name for name in CAMARILLA_LEVEL_PRIORITY if name in matched)
+    strongest = next(name for name in CAMARILLA_LEVEL_PRIORITY if name in fresh)
     level_price = float(levels[strongest])
+    current_position = (
+        "Geçti ve üstünde"
+        if current_close > level_price
+        else "Geçti, geri döndü"
+    )
     return {
         "symbol": symbol.upper(),
-        "status": "Bugün geçen" if fresh else "Daha önce geçen",
+        "status": "Bugün geçen",
+        "current_position": current_position,
         "level": strongest,
         "level_price": round(level_price, 4),
         "close": round(current_close, 4),
         "high": round(float(current["high"]), 4),
         "cross_pct": round((current_source / level_price - 1.0) * 100.0, 2),
+        "close_vs_level_pct": round((current_close / level_price - 1.0) * 100.0, 2),
         "bar_time": frame.index[-1],
         "method": "Kapanış" if use_close else "Mum içi yüksek",
     }
@@ -296,12 +300,10 @@ def scan_camarilla_universe(
     if not rows:
         return pd.DataFrame()
     result = pd.DataFrame(rows)
-    status_rank = {"Bugün geçen": 0, "Daha önce geçen": 1}
     level_rank = {name: index for index, name in enumerate(CAMARILLA_LEVEL_PRIORITY)}
-    result["_status"] = result["status"].map(status_rank).fillna(9)
     result["_level"] = result["level"].map(level_rank).fillna(99)
-    result = result.sort_values(["_status", "_level", "cross_pct"], ascending=[True, True, False])
-    return result.drop(columns=["_status", "_level"]).reset_index(drop=True)
+    result = result.sort_values(["_level", "cross_pct"], ascending=[True, False])
+    return result.drop(columns=["_level"]).reset_index(drop=True)
 
 st.set_page_config(
     page_title="Özlem BIST Breakout Scanner",
@@ -1163,12 +1165,35 @@ def render_camarilla_tab(scan_symbols: list[str]) -> None:
         st.warning(f"{scanned} hissede seçilen seviyelere uygun sonuç bulunamadı.")
         return
 
+    # Kod güncellemesinden önce taranmış sonuçlar açık oturumda kalmışsa
+    # yeni konum sütunlarını kapanış ve seviye fiyatından tamamla.
+    if "current_position" not in results.columns:
+        results = results.copy()
+        results["current_position"] = results.apply(
+            lambda row: (
+                "Geçti ve üstünde"
+                if float(row["close"]) > float(row["level_price"])
+                else "Geçti, geri döndü"
+            ),
+            axis=1,
+        )
+    if "close_vs_level_pct" not in results.columns:
+        results["close_vs_level_pct"] = (
+            (results["close"] / results["level_price"] - 1.0) * 100.0
+        ).round(2)
+
     today_results = results[results["status"] == "Bugün geçen"]
-    earlier_results = results[results["status"] == "Daha önce geçen"]
-    col1, col2, col3 = st.columns(3)
+    returned_results = today_results[
+        today_results["current_position"] == "Geçti, geri döndü"
+    ]
+    above_results = today_results[
+        today_results["current_position"] == "Geçti ve üstünde"
+    ]
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Bugün geçen", len(today_results))
-    col2.metric("Daha önce geçen", len(earlier_results))
-    col3.metric("Taranan", scanned)
+    col2.metric("Üstünde", len(above_results))
+    col3.metric("Geri dönen", len(returned_results))
+    col4.metric("Taranan", scanned)
 
     def _show(frame: pd.DataFrame, key: str) -> None:
         if frame.empty:
@@ -1178,11 +1203,13 @@ def render_camarilla_tab(scan_symbols: list[str]) -> None:
             columns={
                 "symbol": "Hisse",
                 "status": "Durum",
+                "current_position": "Güncel konum",
                 "level": "Seviye",
                 "level_price": "Seviye fiyatı",
-                "close": "Kapanış",
+                "close": "Güncel/Kapanış",
                 "high": "Yüksek",
-                "cross_pct": "Seviye üstü %",
+                "cross_pct": "Geçiş farkı %",
+                "close_vs_level_pct": "Güncel fark %",
                 "bar_time": "Mum tarihi",
                 "method": "Yöntem",
             }
@@ -1196,13 +1223,8 @@ def render_camarilla_tab(scan_symbols: list[str]) -> None:
             key=f"camarilla_download_{key}",
         )
 
-    today_tab, earlier_tab, all_tab = st.tabs(["Bugün geçenler", "Daha önce geçenler", "Tümü"])
-    with today_tab:
-        _show(today_results, "bugun_gecenler")
-    with earlier_tab:
-        _show(earlier_results, "daha_once_gecenler")
-    with all_tab:
-        _show(results, "tum_sonuclar")
+    st.markdown("#### Bugün geçenler")
+    _show(today_results, "bugun_gecenler")
 
 
 ensure_dirs()
@@ -1265,10 +1287,17 @@ with st.sidebar:
 
     st.divider()
     st.header("Universe")
+    universe_options = [
+        UNIVERSE_BIST_ALL,
+        *[choice for choice in UNIVERSE_CHOICES if choice != UNIVERSE_BIST_ALL],
+    ]
+    universe_widget_key = "universe_choice_all_first_v2"
+    if universe_widget_key not in st.session_state:
+        st.session_state[universe_widget_key] = UNIVERSE_BIST_ALL
     universe_choice = st.selectbox(
         "Symbol universe",
-        list(UNIVERSE_CHOICES),
-        index=list(UNIVERSE_CHOICES).index(UNIVERSE_BIST10),
+        universe_options,
+        key=universe_widget_key,
         help="Select the universe of stocks to scan.",
     )
     max_symbols = st.slider(
