@@ -11,6 +11,8 @@ Built with Python, [yfinance](https://github.com/ranaroussi/yfinance), and [Stre
   - **Standard** — Donchian break + volume surge + strong close
   - **Strict (ATR)** — Standard rules + true range > ATR multiplier × ATR(14)
 - **Bullish & bearish** breakouts
+- **Long-period Camarilla:** previous completed 1Y, 5Y and 10Y P/R4/R5 levels
+- **Independent Hacim–DMI–EMA scans:** three separate result tabs; no common-pass requirement
 - **Card and table views** with candlestick charts
 - **Local CSV cache** — scan results persist across app restarts; refresh only on **Force Refresh**
 - **CLI** for headless scans and automation
@@ -73,6 +75,7 @@ OZLEM_BIST_BREAKOUT_SCANNER/
 ├── data_loader.py      # BIST universe + OHLCV fetch/cache
 ├── viop_loader.py      # VİOP symbol list
 ├── ml_engine.py        # Market regime and ML confidence
+├── ortak_tarama.py     # Independent Volume, DMI and EMA scans
 ├── results_store.py    # Scan CSV persistence
 ├── scanner.py          # Parallel universe scan
 ├── run_scanner.py      # CLI entry point

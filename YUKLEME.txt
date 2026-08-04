@@ -1,0 +1,19 @@
+OZLEM HACIM-DMI-EMA GUNCELLEMESI
+
+GitHub deposunun ana (main) dizinine bu paketteki su dosyalari yukleyin:
+
+1. app.py                    (mevcut dosyanin yerine)
+2. ortak_tarama.py           (yeni dosya)
+3. requirements.txt          (mevcut dosyanin yerine)
+4. README.md                 (mevcut dosyanin yerine)
+
+GitHub'da "Commit changes" ile kaydettikten sonra Streamlit uygulamasi
+otomatik olarak yeniden baslar. Uygulamanin sol menusundeki "Tarama turu"
+alaninda ucuncu secenek olarak "Hacim-DMI-EMA" gorunur.
+
+Notlar:
+- Donchian Kirilimi ve Camarilla taramalari korunmustur.
+- Hacim, DMI ve EMA sonuclari birbirinden bagimsiz sekmelerdedir.
+- Ortak gecme sarti yoktur.
+- Eski kesimler listelenmez; kosullar son mumda aranir.
+- Excel indirme istege baglidir.

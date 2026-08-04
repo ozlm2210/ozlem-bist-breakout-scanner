@@ -38,6 +38,7 @@ from results_store import (
     save_scan_results,
 )
 from scanner import filter_results, scan_universe
+from ortak_tarama import render_ortak_tarama
 
 DISCLAIMER_URL = "#disclaimer"
 
@@ -1333,9 +1334,9 @@ with st.sidebar:
     st.divider()
     scan_type = st.radio(
         "Tarama türü",
-        ["Donchian Kırılımı", "Camarilla P–R4–R5"],
+        ["Donchian Kırılımı", "Camarilla P–R4–R5", "Hacim–DMI–EMA"],
         horizontal=False,
-        help="Donchian kırılımı veya uzun dönem Camarilla seviyeleri.",
+        help="Donchian, uzun dönem Camarilla veya bağımsız Hacim–DMI–EMA taraması.",
     )
 
     if scan_type == "Donchian Kırılımı":
@@ -1396,7 +1397,7 @@ with st.sidebar:
                     st.success("Breakout model trained successfully!")
                 else:
                     st.error("Failed to train model.")
-    else:
+    elif scan_type == "Camarilla P–R4–R5":
         st.header("Camarilla P–R4–R5")
         st.info(
             "Önceki tamamlanmış **1, 5 ve 10 yıllık** dönemlerin Camarilla "
@@ -1425,6 +1426,16 @@ with st.sidebar:
             "P = merkez pivot · R4 = güçlü direnç · R5 = üst hedef. "
             "İlk Tüm BIST taraması uzun tarih verisini bir kez indirip önbelleğe alır."
         )
+    else:
+        st.header("Hacim–DMI–EMA")
+        st.info(
+            "Hacim, DMI ve EMA koşulları **ayrı ayrı** taranır. "
+            "Bir sonuçta görünmek için üç taramanın tamamını geçmek gerekmez."
+        )
+        st.caption(
+            "Yalnız son mumdaki koşullar değerlendirilir. İlk Tüm BIST taraması "
+            "günlük ve saatlik verileri güncellerken daha uzun sürebilir."
+        )
 
     _render_disclaimer_sidebar()
 
@@ -1435,7 +1446,9 @@ if scan_type == "Donchian Kırılımı":
         universe_total=universe_total,
         universe_sample=universe_sample,
     )
-else:
+elif scan_type == "Camarilla P–R4–R5":
     render_camarilla_tab(scan_symbols)
+else:
+    render_ortak_tarama(scan_symbols)
 
 _render_disclaimer_footer()
