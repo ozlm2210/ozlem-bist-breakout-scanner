@@ -858,6 +858,10 @@ padding:1.2rem 1.5rem;border-radius:12px;margin-bottom:1rem;">
 <p style="color:#e2e8f0;margin:0.4rem 0 0;">
 Donchian breakouts with volume confirmation on <strong>1 Hour</strong>, <strong>1 Day</strong>,
 <strong>1 Week</strong> and <strong>1 Month</strong> timeframes.
+<br><br>
+BIST hisselerini Donchian kanal kırılımı ve hacim teyidiyle; <strong>1 Saat</strong>,
+<strong>1 Gün</strong>, <strong>1 Hafta</strong> ve <strong>1 Ay</strong> dönemlerinde tarar.
+Araştırma ve eğitim amaçlıdır, yatırım tavsiyesi değildir.
 </p></div>
 """,
     unsafe_allow_html=True,
