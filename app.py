@@ -39,6 +39,7 @@ from results_store import (
 )
 from scanner import filter_results, scan_universe
 from ortak_tarama import render_ortak_tarama
+from guclu_mum import render_guclu_mum
 
 DISCLAIMER_URL = "#disclaimer"
 
@@ -1334,9 +1335,9 @@ with st.sidebar:
     st.divider()
     scan_type = st.radio(
         "Tarama türü",
-        ["Donchian Kırılımı", "Camarilla P–R4–R5", "Hacim–DMI–EMA"],
+        ["Donchian Kırılımı", "Camarilla P–R4–R5", "Hacim–DMI–EMA", "Güçlü Mum"],
         horizontal=False,
-        help="Donchian, uzun dönem Camarilla veya dört filtreli ortak tarama.",
+        help="Donchian, uzun dönem Camarilla veya bağımsız Hacim–DMI–EMA taraması.",
     )
 
     if scan_type == "Donchian Kırılımı":
@@ -1426,16 +1427,20 @@ with st.sidebar:
             "P = merkez pivot · R4 = güçlü direnç · R5 = üst hedef. "
             "İlk Tüm BIST taraması uzun tarih verisini bir kez indirip önbelleğe alır."
         )
-    else:
-        st.header("BIST Ortak Tarama")
+    elif scan_type == "Hacim–DMI–EMA":
+        st.header("Hacim–DMI–EMA")
         st.info(
-            "Hacim, DMI, Günlük EMA ve 4 Saat EMA ayrı filtrelerdir. "
-            "Sonuç yalnız Kesişim Özeti olarak gösterilir."
+            "Hacim, DMI ve EMA koşulları **ayrı ayrı** taranır. "
+            "Bir sonuçta görünmek için üç taramanın tamamını geçmek gerekmez."
         )
         st.caption(
-            "Hisseler geçtikleri filtre sayısına göre sıralanır; "
-            "Excel çıktısında yalnız Kesisim_Ozeti sayfası bulunur."
+            "Yalnız son mumdaki koşullar değerlendirilir. İlk Tüm BIST taraması "
+            "günlük ve saatlik verileri güncellerken daha uzun sürebilir."
         )
+    else:
+        st.header("Güçlü Mum")
+        st.info("Günlük, haftalık ve aylık güçlü mumları tarar; sonuçları tek takip listesinde birleştirir.")
+        st.caption("Excel çıktısı yalnız 4 sayfadır: Günlük, Haftalık, Aylık ve Takip Listesi.")
 
     _render_disclaimer_sidebar()
 
@@ -1448,7 +1453,9 @@ if scan_type == "Donchian Kırılımı":
     )
 elif scan_type == "Camarilla P–R4–R5":
     render_camarilla_tab(scan_symbols)
-else:
+elif scan_type == "Hacim–DMI–EMA":
     render_ortak_tarama(scan_symbols)
+else:
+    render_guclu_mum(scan_symbols)
 
 _render_disclaimer_footer()

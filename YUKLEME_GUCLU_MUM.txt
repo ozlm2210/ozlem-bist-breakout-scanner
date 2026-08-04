@@ -1,0 +1,16 @@
+GITHUB'A YÜKLENECEK DOSYALAR
+
+1) app.py
+2) guclu_mum.py
+3) requirements.txt
+
+Bu üç dosyayı GitHub deposunun ana dizinine yükleyin.
+app.py ve requirements.txt için "Replace" / üzerine yazma işlemini onaylayın.
+guclu_mum.py yeni dosyadır.
+
+Streamlit uygulaması yeniden açıldığında Tarama türü bölümünde "Güçlü Mum" seçeneği görünür.
+Çıktı yalnız 4 sayfadır:
+- GUNLUK_GUCLU_MUM
+- HAFTALIK_GUCLU_MUM
+- AYLIK_GUCLU_MUM
+- TAKIP_LISTESI
