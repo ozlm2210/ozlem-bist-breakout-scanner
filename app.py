@@ -30,6 +30,7 @@ from results_store import (
     save_scan_results,
 )
 from scanner import filter_results, scan_universe
+from prebreakout import scan_prebreakout_universe
 
 DISCLAIMER_URL = "#disclaimer"
 
@@ -848,6 +849,96 @@ def render_breakout_tab(
         st.info("No cached scan yet. Configure settings and click **Force Refresh Scan**.")
 
 
+def render_prebreakout_tab(scan_symbols: list[str]) -> None:
+    """Render the no-score pre-breakout consolidation scan."""
+    st.markdown("### Kırılım Öncesi Sıkışma Taraması")
+    st.caption(
+        "Puanlama yoktur. Yalnızca bütün koşulları birlikte sağlayan hisseler listelenir: "
+        "fiyat > SMA44, EMA10 > EMA34, RSI aralığı, dirence yakınlık, dar bant ve hacim artışı."
+    )
+
+    run_scan = st.button(
+        "Sıkışma Taramasını Başlat",
+        type="primary",
+        key="prebreakout_run",
+        help="Seçilen hisseler için en güncel fiyatları kontrol ederek taramayı başlatır.",
+    )
+    if run_scan:
+        progress = st.progress(0.0, text="Fiyatlar yükleniyor…")
+        status = st.empty()
+
+        def on_progress(done: int, total: int, label: str) -> None:
+            progress.progress(done / max(total, 1), text=f"{label} yükleniyor ({done}/{total})…")
+            status.caption(label)
+
+        with st.spinner("Kırılım öncesi sıkışmalar taranıyor…"):
+            results = scan_prebreakout_universe(
+                scan_symbols,
+                pre_selected_tfs or ["1D"],
+                progress_callback=on_progress,
+                use_cache=pre_use_cache,
+                refresh_prices=True,
+                rsi_min=pre_rsi_min,
+                rsi_max=pre_rsi_max,
+                resistance_lookback=pre_resistance_lookback,
+                max_distance_pct=pre_max_distance_pct,
+                consolidation_bars=pre_consolidation_bars,
+                max_range_pct=pre_max_range_pct,
+                recent_volume_bars=pre_recent_volume_bars,
+                baseline_volume_bars=pre_baseline_volume_bars,
+                min_recent_volume_ratio=pre_min_volume_ratio,
+            )
+        progress.progress(1.0, text="Tamamlandı")
+        status.empty()
+        st.session_state["prebreakout_results"] = results
+        st.session_state["prebreakout_symbols_scanned"] = len(scan_symbols)
+
+    if "prebreakout_results" not in st.session_state:
+        st.info("Ayarları seçip **Sıkışma Taramasını Başlat** düğmesine basın.")
+        return
+
+    results = st.session_state["prebreakout_results"]
+    symbols_scanned = st.session_state.get("prebreakout_symbols_scanned", len(scan_symbols))
+    if results.empty:
+        st.warning(
+            f"{symbols_scanned} hissede bütün sıkışma koşullarını aynı anda sağlayan sonuç bulunamadı."
+        )
+        return
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Aday", len(results))
+    col2.metric("Hisse", results["symbol"].nunique())
+    col3.metric("Taranan", symbols_scanned)
+
+    display = results.rename(
+        columns={
+            "symbol": "Hisse",
+            "timeframe": "Dönem",
+            "bar_time": "Mum tarihi",
+            "close": "Fiyat",
+            "sma44": "SMA44",
+            "ema10": "EMA10",
+            "ema34": "EMA34",
+            "rsi14": "RSI14",
+            "resistance": "Direnç",
+            "distance_to_resistance_pct": "Dirence uzaklık %",
+            "consolidation_range_pct": "Sıkışma aralığı %",
+            "recent_volume_ratio": "Son hacim oranı",
+        }
+    )
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.caption(
+        "Liste dirence en yakın hisseler önde olacak şekilde sıralanır; bu sıralama puanlama değildir."
+    )
+    st.download_button(
+        "CSV İndir",
+        results.to_csv(index=False),
+        file_name="kirilim_oncesi_sikisma.csv",
+        mime="text/csv",
+        key="prebreakout_download",
+    )
+
+
 ensure_dirs()
 
 st.markdown(
@@ -945,71 +1036,117 @@ with st.sidebar:
     st.metric("Symbols to scan", len(scan_symbols))
 
     st.divider()
-    st.header("Breakout Scan Settings")
-    breakout_mode_label = st.selectbox(
-        "Breakout mode",
-        ["Standard", "Strict (ATR)"],
-        index=0,
-        help=(
-            "Standard: Donchian + volume + strong close. "
-            "Strict: adds true range > ATR multiplier × ATR(14); default 1.5× volume on 1D."
-        ),
+    scan_type = st.radio(
+        "Tarama türü",
+        ["Donchian Kırılımı", "Kırılım Öncesi Sıkışma"],
+        horizontal=False,
+        help="Mevcut kırılım taraması veya henüz kırılmamış sıkışma adayları.",
     )
-    breakout_mode = "strict" if breakout_mode_label == "Strict (ATR)" else "standard"
-    selected_tfs = st.multiselect(
-        "Timeframes",
-        options=list(TIMEFRAME_ORDER),
-        default=["1H", "1D", "1W", "1M"],
-        format_func=lambda k: TIMEFRAMES[k].label,
-    )
-    selected_tfs = sort_timeframes(selected_tfs)
-    direction = st.selectbox("Direction", ["Both", "Bullish", "Bearish"], index=0)
-    vol_default = STRICT_VOL_MULT if breakout_mode == "strict" else 1.25
-    vol_mult = st.slider("Min volume ratio", 1.0, 3.0, vol_default, 0.05)
-    lookback = st.slider("Donchian lookback (bars)", 5, 60, 20, 1)
-    atr_mult = st.slider(
-        "Min TR / ATR(14) ratio",
-        0.8,
-        2.0,
-        STRICT_ATR_MULT,
-        0.05,
-        disabled=breakout_mode != "strict",
-        help="Breakout bar true range must exceed this multiple of 14-bar ATR.",
-    )
-    only_52w = st.checkbox("52-week high breakouts only (1D/1W/1M)", value=False)
-    use_cache = st.checkbox(
-        "Use price cache",
-        value=True,
-        help="Speeds up later scans. Force Refresh still checks Yahoo for the newest bars.",
-    )
-    if breakout_mode == "strict":
-        st.caption(
-            "Strict: close > prior N-bar high/low · volume > threshold × 20-bar avg · "
-            "true range > ATR mult × ATR(14) · strong close."
-        )
-    else:
-        st.caption(
-            "Standard: close > prior N-bar high/low + volume surge + strong close. "
-            "Weekly (Fri close) and monthly bars resampled from daily data."
-        )
 
-    st.header("ML Confidence Models")
-    if st.button("Train ML Model", use_container_width=True, help="Re-trains the Random Forest breakout classifier on stock histories."):
-        from ml_engine import train_confidence_model
-        with st.spinner("Training Breakout ML Model..."):
-            m_breakout = train_confidence_model(use_cache=False)
-            if m_breakout is not None:
-                st.success("Breakout model trained successfully!")
-            else:
-                st.error("Failed to train model.")
+    if scan_type == "Donchian Kırılımı":
+        st.header("Breakout Scan Settings")
+        breakout_mode_label = st.selectbox(
+            "Breakout mode",
+            ["Standard", "Strict (ATR)"],
+            index=0,
+            help=(
+                "Standard: Donchian + volume + strong close. "
+                "Strict: adds true range > ATR multiplier × ATR(14); default 1.5× volume on 1D."
+            ),
+        )
+        breakout_mode = "strict" if breakout_mode_label == "Strict (ATR)" else "standard"
+        selected_tfs = st.multiselect(
+            "Timeframes",
+            options=list(TIMEFRAME_ORDER),
+            default=["1H", "1D", "1W", "1M"],
+            format_func=lambda k: TIMEFRAMES[k].label,
+        )
+        selected_tfs = sort_timeframes(selected_tfs)
+        direction = st.selectbox("Direction", ["Both", "Bullish", "Bearish"], index=0)
+        vol_default = STRICT_VOL_MULT if breakout_mode == "strict" else 1.25
+        vol_mult = st.slider("Min volume ratio", 1.0, 3.0, vol_default, 0.05)
+        lookback = st.slider("Donchian lookback (bars)", 5, 60, 20, 1)
+        atr_mult = st.slider(
+            "Min TR / ATR(14) ratio",
+            0.8,
+            2.0,
+            STRICT_ATR_MULT,
+            0.05,
+            disabled=breakout_mode != "strict",
+            help="Breakout bar true range must exceed this multiple of 14-bar ATR.",
+        )
+        only_52w = st.checkbox("52-week high breakouts only (1D/1W/1M)", value=False)
+        use_cache = st.checkbox(
+            "Use price cache",
+            value=True,
+            help="Speeds up later scans. Force Refresh still checks Yahoo for the newest bars.",
+        )
+        if breakout_mode == "strict":
+            st.caption(
+                "Strict: close > prior N-bar high/low · volume > threshold × 20-bar avg · "
+                "true range > ATR mult × ATR(14) · strong close."
+            )
+        else:
+            st.caption(
+                "Standard: close > prior N-bar high/low + volume surge + strong close. "
+                "Weekly (Fri close) and monthly bars resampled from daily data."
+            )
+
+        st.header("ML Confidence Models")
+        if st.button("Train ML Model", use_container_width=True, help="Re-trains the Random Forest breakout classifier on stock histories."):
+            from ml_engine import train_confidence_model
+            with st.spinner("Training Breakout ML Model..."):
+                m_breakout = train_confidence_model(use_cache=False)
+                if m_breakout is not None:
+                    st.success("Breakout model trained successfully!")
+                else:
+                    st.error("Failed to train model.")
+    else:
+        st.header("Kırılım Öncesi Sıkışma")
+        st.success("Ana fiyat koşulu: **Fiyat > SMA44** (EMA44 kullanılmaz).")
+        pre_selected_tfs = st.multiselect(
+            "Dönemler",
+            options=list(TIMEFRAME_ORDER),
+            default=["1D", "1W", "1M"],
+            format_func=lambda key: TIMEFRAMES[key].label,
+            key="prebreakout_timeframes",
+        )
+        pre_selected_tfs = sort_timeframes(pre_selected_tfs)
+        pre_rsi_min, pre_rsi_max = st.slider(
+            "RSI14 aralığı",
+            30.0,
+            80.0,
+            (50.0, 65.0),
+            1.0,
+        )
+        pre_resistance_lookback = st.slider("Direnç bakış süresi (mum)", 10, 60, 20, 1)
+        pre_max_distance_pct = st.slider("Dirence en fazla uzaklık (%)", 1.0, 10.0, 5.0, 0.5)
+        pre_consolidation_bars = st.slider("Sıkışma süresi (mum)", 5, 30, 10, 1)
+        pre_max_range_pct = st.slider("En fazla sıkışma aralığı (%)", 2.0, 15.0, 8.0, 0.5)
+        pre_recent_volume_bars = st.slider("Son hacim ortalaması (mum)", 2, 10, 5, 1)
+        pre_baseline_volume_bars = st.slider("Karşılaştırma hacmi (mum)", 10, 40, 20, 1)
+        pre_min_volume_ratio = st.slider("En az son hacim oranı", 0.8, 2.0, 1.0, 0.05)
+        pre_use_cache = st.checkbox(
+            "Fiyat önbelleğini kullan",
+            value=True,
+            key="prebreakout_cache",
+            help="Tarama başlatıldığında en yeni mum ayrıca kontrol edilir.",
+        )
+        st.caption(
+            "Koşullar: Fiyat > SMA44 · EMA10 > EMA34 · RSI14 seçilen aralıkta · "
+            "henüz direnç kırılmamış · dar bant · son hacim ortalaması yükselmiş."
+        )
 
     _render_disclaimer_sidebar()
 
-render_breakout_tab(
-    scan_symbols,
-    universe_choice=universe_choice,
-    universe_total=universe_total,
-    universe_sample=universe_sample,
-)
+if scan_type == "Donchian Kırılımı":
+    render_breakout_tab(
+        scan_symbols,
+        universe_choice=universe_choice,
+        universe_total=universe_total,
+        universe_sample=universe_sample,
+    )
+else:
+    render_prebreakout_tab(scan_symbols)
 
 _render_disclaimer_footer()
