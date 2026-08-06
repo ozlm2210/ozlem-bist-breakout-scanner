@@ -7,3 +7,4 @@ scipy>=1.11
 scikit-learn
 tradingview-screener==2.5.0
 openpyxl>=3.1
+git+https://github.com/rongardF/tvdatafeed.git
