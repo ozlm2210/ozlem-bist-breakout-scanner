@@ -2,17 +2,9 @@
 
 from __future__ import annotations
 
-import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, timedelta
-from pathlib import Path
-from typing import Callable, Optional
-from urllib.request import Request, urlopen
-
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
 from plotly.subplots import make_subplots
 
 from config import (
@@ -21,16 +13,13 @@ from config import (
     TIMEFRAMES,
     TIMEFRAME_ORDER,
     UNIVERSE_CHOICES,
-    UNIVERSE_BIST10,
     UNIVERSE_BIST_ALL,
     UNIVERSE_VIOP,
-    DATA_DIR,
-    YFINANCE_SUFFIX,
     ensure_dirs,
     sort_timeframes,
 )
-from data_loader import load_bars, load_daily, load_universe_symbols, resolve_universe_symbols
-from viop_loader import viop_symbol_set, load_viop_symbols
+from data_loader import load_bars, load_universe_symbols, resolve_universe_symbols
+from viop_loader import viop_symbol_set
 from results_store import (
     cached_scan_available,
     format_scanned_at,
@@ -38,274 +27,9 @@ from results_store import (
     save_scan_results,
 )
 from scanner import filter_results, scan_universe
-from ortak_tarama import render_ortak_tarama
-from guclu_mum import render_guclu_mum
 
 DISCLAIMER_URL = "#disclaimer"
 
-CAMARILLA_CACHE = DATA_DIR / "camarilla_daily"
-CAMARILLA_LEVEL_PRIORITY = (
-    "10Y R5", "10Y R4", "10Y P",
-    "5Y R5", "5Y R4", "5Y P",
-    "1Y R5", "1Y R4", "1Y P",
-)
-
-
-def _cam_p(high: float, low: float, close: float) -> float:
-    return (high + low + close) / 3.0
-
-
-def _cam_r4(high: float, low: float, close: float) -> float:
-    return close + 1.1 * (high - low) / 2.0
-
-
-def _cam_r5(high: float, low: float, close: float) -> float:
-    return (high / low) * close if low else float("nan")
-
-
-def _cam_normalize(frame: pd.DataFrame) -> pd.DataFrame:
-    if frame is None or frame.empty:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-    out = frame.copy()
-    if isinstance(out.columns, pd.MultiIndex):
-        out.columns = out.columns.get_level_values(0)
-    out = out.rename(columns=lambda value: str(value).lower())
-    out = out.loc[:, ~out.columns.duplicated()]
-    keep = [name for name in ("open", "high", "low", "close", "volume") if name in out]
-    out = out[keep]
-    for name in keep:
-        out[name] = pd.to_numeric(out[name], errors="coerce")
-    out.index = pd.to_datetime(out.index).tz_localize(None).normalize()
-    out = out[~out.index.duplicated(keep="last")].sort_index()
-    return out.dropna(subset=["high", "low", "close"])
-
-
-def _cam_ticker(symbol: str) -> str:
-    return f"{symbol.upper().strip()}{YFINANCE_SUFFIX}"
-
-
-def _cam_required_start(selected_levels: list[str], today: date) -> date:
-    starts = [today.year - 1]
-    if any(level.startswith("5Y") for level in selected_levels):
-        starts.append((today.year // 5) * 5 - 5)
-    if any(level.startswith("10Y") for level in selected_levels):
-        starts.append((today.year // 10) * 10 - 10)
-    return date(min(starts), 1, 1)
-
-
-def _cam_read_cache(symbol: str) -> pd.DataFrame:
-    path = CAMARILLA_CACHE / f"{symbol.upper()}.csv"
-    if not path.is_file():
-        return pd.DataFrame()
-    try:
-        return _cam_normalize(pd.read_csv(path, parse_dates=["date"], index_col="date"))
-    except Exception:
-        return pd.DataFrame()
-
-
-def _cam_write_cache(symbol: str, frame: pd.DataFrame) -> None:
-    if frame.empty:
-        return
-    CAMARILLA_CACHE.mkdir(parents=True, exist_ok=True)
-    out = frame.copy()
-    out.index.name = "date"
-    out.to_csv(CAMARILLA_CACHE / f"{symbol.upper()}.csv")
-
-
-def _cam_extract_ticker(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-    if not isinstance(raw.columns, pd.MultiIndex):
-        return _cam_normalize(raw)
-    level0 = raw.columns.get_level_values(0)
-    level1 = raw.columns.get_level_values(1)
-    try:
-        if ticker in level0:
-            return _cam_normalize(raw[ticker])
-        if ticker in level1:
-            return _cam_normalize(raw.xs(ticker, axis=1, level=1))
-    except Exception:
-        return pd.DataFrame()
-    return pd.DataFrame()
-
-
-def _cam_download_batch(symbols: list[str], start: date) -> dict[str, pd.DataFrame]:
-    tickers = [_cam_ticker(symbol) for symbol in symbols]
-    try:
-        raw = yf.download(
-            tickers=tickers,
-            start=start.isoformat(),
-            end=(date.today() + timedelta(days=1)).isoformat(),
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            group_by="ticker",
-            threads=True,
-        )
-    except Exception:
-        return {}
-    return {symbol: _cam_extract_ticker(raw, _cam_ticker(symbol)) for symbol in symbols}
-
-
-def _cam_live_snapshots(symbols: list[str]) -> dict[str, pd.DataFrame]:
-    wanted = {symbol.upper().strip() for symbol in symbols}
-    payload = {
-        "markets": ["turkey"],
-        "symbols": {"query": {"types": []}, "tickers": []},
-        "options": {"lang": "en"},
-        "columns": ["name", "exchange", "open", "high", "low", "close", "volume"],
-        "range": [0, 1000],
-    }
-    try:
-        request = Request(
-            "https://scanner.tradingview.com/turkey/scan",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
-            method="POST",
-        )
-        with urlopen(request, timeout=30) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except Exception:
-        return {}
-    snapshots: dict[str, pd.DataFrame] = {}
-    columns = payload["columns"]
-    for item in body.get("data", []):
-        values = item.get("d", [])
-        if len(values) != len(columns):
-            continue
-        row = dict(zip(columns, values))
-        symbol = str(row.get("name", "")).upper().strip()
-        if symbol not in wanted or str(row.get("exchange", "")).upper() != "BIST":
-            continue
-        frame = pd.DataFrame(
-            [{key: row.get(key) for key in ("open", "high", "low", "close", "volume")}],
-            index=pd.DatetimeIndex([pd.Timestamp.today().normalize()], name="date"),
-        )
-        snapshots[symbol] = _cam_normalize(frame)
-    return snapshots
-
-
-def _cam_calculate_levels(daily: pd.DataFrame, today: date | None = None) -> dict[str, float]:
-    if daily is None or daily.empty:
-        return {}
-    today = today or date.today()
-    frame = daily.sort_index()
-    annual = frame.groupby(frame.index.year).agg(
-        high=("high", "max"), low=("low", "min"), close=("close", "last")
-    ).dropna(subset=["high", "low", "close"])
-    blocks = {
-        "1Y": (today.year - 1, today.year - 1),
-        "5Y": ((today.year // 5) * 5 - 5, (today.year // 5) * 5 - 1),
-        "10Y": ((today.year // 10) * 10 - 10, (today.year // 10) * 10 - 1),
-    }
-    levels: dict[str, float] = {}
-    for label, (start_year, end_year) in blocks.items():
-        block = annual.loc[(annual.index >= start_year) & (annual.index <= end_year)]
-        if block.empty:
-            continue
-        high = float(block["high"].max())
-        low = float(block["low"].min())
-        close = float(block.iloc[-1]["close"])
-        levels[f"{label} P"] = _cam_p(high, low, close)
-        levels[f"{label} R4"] = _cam_r4(high, low, close)
-        levels[f"{label} R5"] = _cam_r5(high, low, close)
-    return levels
-
-
-def _cam_detect(
-    daily: pd.DataFrame,
-    symbol: str,
-    selected_levels: list[str],
-    *,
-    use_close: bool = False,
-) -> Optional[dict]:
-    if daily is None or len(daily) < 2:
-        return None
-    frame = daily.sort_index()
-    levels = _cam_calculate_levels(frame)
-    current, previous = frame.iloc[-1], frame.iloc[-2]
-    source = "close" if use_close else "high"
-    current_source, previous_source = float(current[source]), float(previous[source])
-    current_close = float(current["close"])
-    fresh = []
-    for name in selected_levels:
-        level = levels.get(name)
-        if level is None or pd.isna(level):
-            continue
-        if current_source > level and previous_source <= level:
-            fresh.append(name)
-    if not fresh:
-        return None
-    strongest = next(name for name in CAMARILLA_LEVEL_PRIORITY if name in fresh)
-    level_price = float(levels[strongest])
-    current_position = (
-        "Geçti ve üstünde"
-        if current_close > level_price
-        else "Geçti, geri döndü"
-    )
-    return {
-        "symbol": symbol.upper(),
-        "status": "Bugün geçen",
-        "current_position": current_position,
-        "level": strongest,
-        "level_price": round(level_price, 4),
-        "close": round(current_close, 4),
-        "high": round(float(current["high"]), 4),
-        "cross_pct": round((current_source / level_price - 1.0) * 100.0, 2),
-        "close_vs_level_pct": round((current_close / level_price - 1.0) * 100.0, 2),
-        "bar_time": frame.index[-1],
-        "method": "Kapanış" if use_close else "Mum içi yüksek",
-    }
-
-
-def scan_camarilla_universe(
-    symbols: list[str],
-    selected_levels: list[str],
-    *,
-    use_close: bool = False,
-    progress_callback: Optional[Callable[[int, int, str], None]] = None,
-    max_workers: int = 6,
-) -> pd.DataFrame:
-    symbols = [str(symbol).upper().strip() for symbol in symbols]
-    CAMARILLA_CACHE.mkdir(parents=True, exist_ok=True)
-    required_start = _cam_required_start(selected_levels, date.today())
-    histories = {symbol: _cam_read_cache(symbol) for symbol in symbols}
-    missing = [
-        symbol for symbol, frame in histories.items()
-        if frame.empty or frame.index[0].date() > required_start
-    ]
-    chunks = [missing[index:index + 25] for index in range(0, len(missing), 25)]
-    downloaded: dict[str, pd.DataFrame] = {}
-    if chunks:
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(chunks))) as pool:
-            futures = [pool.submit(_cam_download_batch, chunk, required_start) for chunk in chunks]
-            for future in as_completed(futures):
-                downloaded.update(future.result())
-    snapshots = _cam_live_snapshots(symbols)
-    rows: list[dict] = []
-    total = len(symbols)
-    for index, symbol in enumerate(symbols, start=1):
-        frame = downloaded.get(symbol, histories.get(symbol, pd.DataFrame()))
-        cached = histories.get(symbol, pd.DataFrame())
-        if not cached.empty and not frame.empty:
-            frame = _cam_normalize(pd.concat([cached, frame]))
-        snapshot = snapshots.get(symbol)
-        if snapshot is not None and not snapshot.empty:
-            frame = _cam_normalize(pd.concat([frame, snapshot]))
-        if not frame.empty:
-            _cam_write_cache(symbol, frame)
-            row = _cam_detect(frame, symbol, selected_levels, use_close=use_close)
-            if row:
-                rows.append(row)
-        if progress_callback:
-            progress_callback(index, total, symbol)
-    if not rows:
-        return pd.DataFrame()
-    result = pd.DataFrame(rows)
-    level_rank = {name: index for index, name in enumerate(CAMARILLA_LEVEL_PRIORITY)}
-    result["_level"] = result["level"].map(level_rank).fillna(99)
-    result = result.sort_values(["_level", "cross_pct"], ascending=[True, False])
-    return result.drop(columns=["_level"]).reset_index(drop=True)
 
 st.set_page_config(
     page_title="Özlem BIST Breakout Scanner",
@@ -672,10 +396,6 @@ def _breakout_card_html(row: pd.Series) -> str:
         badges.append('<span class="card-pill high52">52W High</span>')
     if is_strict:
         badges.append('<span class="card-pill high52">Strict</span>')
-    
-    ml_conf = row.get("ml_confidence")
-    if ml_conf is not None and pd.notna(ml_conf):
-        badges.append(f'<span class="card-pill ml-conf" style="background: rgba(37,99,235,0.25); color: #bfdbfe; font-weight: bold;">ML Conf: {float(ml_conf):.0f}%</span>')
 
     stats_row1 = [
         f'<span class="card-stat">Close <b>₺{float(row["close"]):,.2f}</b></span>',
@@ -734,10 +454,6 @@ def _style_results(df: pd.DataFrame) -> pd.DataFrame:
     out["direction"] = out["direction"].map(lambda d: _DIR_STYLE.get(d, ("—", ""))[0])
     out["timeframe"] = out["timeframe"].map(lambda t: TIMEFRAMES[t].label if t in TIMEFRAMES else t)
     out["is_52w_high"] = out["is_52w_high"].map(lambda x: "Yes" if x else "No")
-    if "ml_confidence" in out.columns:
-        out["ml_confidence"] = out["ml_confidence"].map(
-            lambda x: f"{float(x):.1f}%" if x is not None and pd.notna(x) else "—"
-        )
     if "mode" in out.columns:
         out["mode"] = out["mode"].map(lambda m: "Strict (ATR)" if m == "strict" else "Standard")
     rename = {
@@ -757,7 +473,6 @@ def _style_results(df: pd.DataFrame) -> pd.DataFrame:
         "bar_time": "Bar Date",
         "lookback": "Lookback",
         "is_52w_high": "52W High?",
-        "ml_confidence": "ML Confidence",
     }
     return out.rename(columns={k: v for k, v in rename.items() if k in out.columns})
 
@@ -833,8 +548,6 @@ def _confluence_card_html(symbol: str, direction: str, group_df: pd.DataFrame) -
         sign = "+" if break_pct >= 0 else ""
         vol = row.get("volume_ratio")
         vol_txt = f"{float(vol):.2f}×" if vol is not None and pd.notna(vol) else "—"
-        ml_conf = row.get("ml_confidence")
-        ml_txt = f"{float(ml_conf):.0f}%" if ml_conf is not None and pd.notna(ml_conf) else "—"
         
         tf_badge_class = "high52" if tf in ("1W", "1M") else ""
         
@@ -843,7 +556,6 @@ def _confluence_card_html(symbol: str, direction: str, group_df: pd.DataFrame) -
             f'  <span class="card-pill {tf_badge_class}" style="margin: 0; padding: 2px 6px; font-size: 0.72rem;">{tf_label}</span>'
             f'  <span>₺{close_val:,.2f} ({sign}{break_pct:.1f}%)</span>'
             f'  <span>Vol: <b>{vol_txt}</b></span>'
-            f'  <span style="color: #93c5fd;">ML: <b>{ml_txt}</b></span>'
             f'</div>'
         )
         timeframe_rows_html.append(row_html)
@@ -871,9 +583,6 @@ def _style_confluence_results(confluence_symbols) -> pd.DataFrame:
             "Direction": "Bullish" if direction.lower() == "bullish" else "Bearish",
             "Timeframes": tfs_str,
         }
-        
-        ml_confs = [float(val) for val in group["ml_confidence"].dropna() if pd.notna(val)]
-        row["Max ML Confidence"] = f"{max(ml_confs):.0f}%" if ml_confs else "—"
         
         for tf in ("1H", "1D", "1W", "1M"):
             tf_row = group[group["timeframe"] == tf]
@@ -1122,112 +831,6 @@ def render_breakout_tab(
         st.info("No cached scan yet. Configure settings and click **Force Refresh Scan**.")
 
 
-def render_camarilla_tab(scan_symbols: list[str]) -> None:
-    st.markdown("### Camarilla P–R4–R5 Taraması")
-    st.caption(
-        "Seçtiğiniz 1Y, 5Y ve 10Y Camarilla seviyelerini tarar. "
-        "Aynı mumda birden fazla seviye geçilirse Pine kodundaki en güçlü seviye gösterilir."
-    )
-    if not camarilla_levels:
-        st.warning("Taramak için en az bir Camarilla seviyesi seçin.")
-        return
-
-    run_scan = st.button(
-        "Camarilla Taramasını Başlat",
-        type="primary",
-        key="camarilla_run",
-    )
-    if run_scan:
-        progress = st.progress(0.0, text="Uzun dönem fiyat geçmişi yükleniyor…")
-        status = st.empty()
-
-        def on_progress(done: int, total: int, label: str) -> None:
-            progress.progress(done / max(total, 1), text=f"{label} taranıyor ({done}/{total})…")
-            status.caption(label)
-
-        with st.spinner("Camarilla seviyeleri hesaplanıyor…"):
-            results = scan_camarilla_universe(
-                scan_symbols,
-                camarilla_levels,
-                use_close=camarilla_use_close,
-                progress_callback=on_progress,
-            )
-        progress.progress(1.0, text="Tamamlandı")
-        status.empty()
-        st.session_state["camarilla_results"] = results
-        st.session_state["camarilla_symbols_scanned"] = len(scan_symbols)
-
-    if "camarilla_results" not in st.session_state:
-        st.info("Seviyeleri seçip **Camarilla Taramasını Başlat** düğmesine basın.")
-        return
-
-    results = st.session_state["camarilla_results"]
-    scanned = st.session_state.get("camarilla_symbols_scanned", len(scan_symbols))
-    if results.empty:
-        st.warning(f"{scanned} hissede seçilen seviyelere uygun sonuç bulunamadı.")
-        return
-
-    # Kod güncellemesinden önce taranmış sonuçlar açık oturumda kalmışsa
-    # yeni konum sütunlarını kapanış ve seviye fiyatından tamamla.
-    if "current_position" not in results.columns:
-        results = results.copy()
-        results["current_position"] = results.apply(
-            lambda row: (
-                "Geçti ve üstünde"
-                if float(row["close"]) > float(row["level_price"])
-                else "Geçti, geri döndü"
-            ),
-            axis=1,
-        )
-    if "close_vs_level_pct" not in results.columns:
-        results["close_vs_level_pct"] = (
-            (results["close"] / results["level_price"] - 1.0) * 100.0
-        ).round(2)
-
-    today_results = results[results["status"] == "Bugün geçen"]
-    returned_results = today_results[
-        today_results["current_position"] == "Geçti, geri döndü"
-    ]
-    above_results = today_results[
-        today_results["current_position"] == "Geçti ve üstünde"
-    ]
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Bugün geçen", len(today_results))
-    col2.metric("Üstünde", len(above_results))
-    col3.metric("Geri dönen", len(returned_results))
-    col4.metric("Taranan", scanned)
-
-    def _show(frame: pd.DataFrame, key: str) -> None:
-        if frame.empty:
-            st.info("Bu bölümde sonuç bulunamadı.")
-            return
-        display = frame.rename(
-            columns={
-                "symbol": "Hisse",
-                "status": "Durum",
-                "current_position": "Güncel konum",
-                "level": "Seviye",
-                "level_price": "Seviye fiyatı",
-                "close": "Güncel/Kapanış",
-                "high": "Yüksek",
-                "cross_pct": "Geçiş farkı %",
-                "close_vs_level_pct": "Güncel fark %",
-                "bar_time": "Mum tarihi",
-                "method": "Yöntem",
-            }
-        )
-        st.dataframe(display, use_container_width=True, hide_index=True)
-        st.download_button(
-            "CSV İndir",
-            frame.to_csv(index=False),
-            file_name=f"camarilla_{key}.csv",
-            mime="text/csv",
-            key=f"camarilla_download_{key}",
-        )
-
-    st.markdown("#### Bugün geçenler")
-    _show(today_results, "bugun_gecenler")
-
 
 ensure_dirs()
 
@@ -1253,41 +856,6 @@ _render_disclaimer_banner()
 universe = load_universe_symbols()
 
 with st.sidebar:
-    st.header("Market Regime")
-    if "market_regime" not in st.session_state:
-        with st.spinner("Classifying market regime..."):
-            try:
-                from ml_engine import get_market_regime_classification
-                st.session_state["market_regime"] = get_market_regime_classification()
-            except Exception:
-                st.session_state["market_regime"] = {
-                    "name": "Unknown (ML Offline)",
-                    "desc": "Regime classifier is offline (missing dependencies or initialization error).",
-                    "color": "#9aa0a6"
-                }
-            
-    regime = st.session_state["market_regime"]
-    st.markdown(
-        f'<div style="background-color: {regime["color"]}18; padding: 12px; border-left: 4px solid {regime["color"]}; border-radius: 4px; margin-bottom: 15px;">'
-        f'<span style="font-size: 0.78rem; text-transform: uppercase; color: #9aa0a6; font-weight: bold;">XU100 Durumu</span><br>'
-        f'<span style="font-size: 1.1rem; font-weight: bold; color: {regime["color"]};">{regime["name"]}</span><br>'
-        f'<span style="font-size: 0.82rem; color: #cbd5e1; line-height: 1.35; display: inline-block; margin-top: 4px;">{regime["desc"]}</span>'
-        f'</div>',
-        unsafe_allow_html=True
-    )
-    if st.button("Refresh Market Regime", use_container_width=True, key="refresh_regime_btn"):
-        try:
-            from ml_engine import get_market_regime_classification
-            st.session_state["market_regime"] = get_market_regime_classification()
-        except Exception:
-            st.session_state["market_regime"] = {
-                "name": "Unknown (ML Offline)",
-                "desc": "Regime classifier is offline.",
-                "color": "#9aa0a6"
-            }
-        st.rerun()
-
-    st.divider()
     st.header("Universe")
     universe_options = [
         UNIVERSE_BIST_ALL,
@@ -1380,16 +948,6 @@ with st.sidebar:
             "Standard: close > prior N-bar high/low + volume surge + strong close. "
             "Weekly (Fri close) and monthly bars resampled from daily data."
         )
-
-    st.header("ML Confidence Models")
-    if st.button("Train ML Model", use_container_width=True, help="Re-trains the Random Forest breakout classifier on stock histories."):
-        from ml_engine import train_confidence_model
-        with st.spinner("Training Breakout ML Model..."):
-            m_breakout = train_confidence_model(use_cache=False)
-            if m_breakout is not None:
-                st.success("Breakout model trained successfully!")
-            else:
-                st.error("Failed to train model.")
 
     _render_disclaimer_sidebar()
 
