@@ -1,14 +1,11 @@
-# Özlem BIST Tarama Uygulaması
+# Özlem BIST Breakout Scanner
 
-Bu güncelleme mevcut Donchian ve Camarilla bölümlerini korur; üçüncü tarama bölümü gönderilen **BIST ORTAK TARAMA — SADECE İLK SAYFA** koduna göre çalışır.
+BIST hisselerini Donchian kanal kırılımı ve hacim teyidiyle tarar.
 
-## Ortak tarama
+Zaman dilimleri:
+- 1 Saat
+- 1 Gün
+- 1 Hafta
+- 1 Ay
 
-Dört ayrı ana filtre vardır:
-
-- Hacim
-- DMI
-- Günlük EMA
-- 4 Saat EMA
-
-Uygulama yalnız `Kesisim_Ozeti` tablosunu gösterir. Excel çıktısında da yalnız `Kesisim_Ozeti` sayfası bulunur. Hisseler geçtikleri filtre sayısına göre azalan sırada listelenir.
+Araştırma ve eğitim amaçlıdır. Yatırım tavsiyesi değildir.
